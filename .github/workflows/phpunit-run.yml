@@ -1,0 +1,221 @@
+# Reusable PHPUnit job for a CiviCRM extension repository.
+#
+# Builds a throwaway CiviCRM Standalone install on the runner, installs the
+# extension under test plus its dependencies, and runs its PHPUnit suite.
+# Nothing here is specific to one extension: the key comes from info.xml.
+#
+# Call it from a workflow that says which stacks to test:
+#
+#   jobs:
+#     phpunit:
+#       uses: ./.github/workflows/phpunit-run.yml
+#       with:
+#         php-version: "8.3"
+#         civicrm-version: "~6.17.0"
+
+name: PHPUnit runner
+
+on:
+  workflow_call:
+    inputs:
+      php-version:
+        description: PHP version to run the tests under.
+        required: true
+        type: string
+      civicrm-version:
+        description: Composer constraint for civicrm/civicrm-core and civicrm/civicrm-packages.
+        required: true
+        type: string
+      experimental:
+        description: Report this stack but never fail the pull request over it.
+        type: boolean
+        default: false
+      git-dependencies:
+        description: >-
+          Extensions to clone, as "<key>|<repository>|<ref>", whitespace
+          separated, for versions that are not released yet.
+        type: string
+        default: ""
+      extension-dependencies:
+        description: Extension keys to fetch from the extension directory.
+        type: string
+        default: ""
+
+env:
+  DB_NAME: civicrm
+  DB_DSN: mysql://root:@127.0.0.1:3306/civicrm
+  COMPOSER_MEMORY_LIMIT: "-1"
+
+jobs:
+  phpunit:
+    name: PHP ${{ inputs.php-version }} / CiviCRM ${{ inputs.civicrm-version }}
+    runs-on: ubuntu-latest
+    # The job is still reported, but a failure leaves the calling workflow green.
+    continue-on-error: ${{ inputs.experimental }}
+    services:
+      mariadb:
+        image: mariadb:11.8
+        env:
+          MARIADB_ALLOW_EMPTY_ROOT_PASSWORD: "yes"
+          MARIADB_DATABASE: civicrm
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="healthcheck.sh --connect --innodb_initialized"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+
+    steps:
+      - name: Set up paths
+        # $RUNNER_TEMP is out of reach of a workflow- or job-level `env`, which
+        # cannot see the runner context.
+        run: echo "CIVI_ROOT=$RUNNER_TEMP/civicrm-standalone" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v7
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ inputs.php-version }}
+          # Every ext-* requirement in civicrm-core's dependency tree that the
+          # runner does not already ship -- gd is a transitive one, via
+          # phpoffice/phpword.
+          extensions: bcmath, curl, dom, gd, intl, mbstring, mysqli, pdo_mysql, simplexml, soap, zip
+          coverage: none
+          tools: composer:v2
+
+      - name: Install cv
+        run: |
+          mkdir -p "$HOME/bin"
+          curl -sSLf -o "$HOME/bin/cv" https://download.civicrm.org/cv/cv.phar
+          chmod +x "$HOME/bin/cv"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Cache composer downloads
+        uses: actions/cache@v6
+        with:
+          # Both versions: the jobs run concurrently and composer's cache is
+          # platform-sensitive, so a shared key would race.
+          key: composer-${{ inputs.civicrm-version }}-${{ inputs.php-version }}
+          path: ~/.cache/composer
+
+      - name: Build CiviCRM Standalone
+        env:
+          CIVICRM_VERSION: ${{ inputs.civicrm-version }}
+        run: |
+          git clone --depth 1 https://github.com/civicrm/civicrm-standalone.git "$CIVI_ROOT"
+          cd "$CIVI_ROOT"
+          # Answer the composer-compile-plugin up front; it prompts otherwise.
+          composer config extra.compile-mode all
+          # Set the constraint through composer rather than editing composer.json
+          # by hand: the key is "civicrm/civicrm-core", so a pattern anchored on
+          # "civicrm-core" silently matches nothing and builds dev-master instead.
+          composer require --no-update --no-interaction \
+            civicrm/civicrm-core:"$CIVICRM_VERSION" civicrm/civicrm-packages:"$CIVICRM_VERSION"
+          composer install --no-interaction --no-progress
+          composer require -w --no-interaction --no-progress phpunit/phpunit:'^9'
+
+      - name: Check the core version that was built
+        # A constraint that quietly resolved to something else would otherwise
+        # be reported as a pass against the version that was asked for.
+        env:
+          CIVICRM_VERSION: ${{ inputs.civicrm-version }}
+        run: |
+          built=$(php -r 'echo simplexml_load_file(getenv("CIVI_ROOT") . "/vendor/civicrm/civicrm-core/xml/version.xml")->version_no;')
+          echo "civicrm-core built: $built (requested $CIVICRM_VERSION)"
+          case "$CIVICRM_VERSION" in
+            dev-*) ;;
+            *)
+              want=$(echo "$CIVICRM_VERSION" | tr -d '~^><=' | cut -d. -f1,2)
+              case "$built" in
+                "$want".*|"$want") ;;
+                *) echo "Expected civicrm-core $want.x but built $built"; exit 1 ;;
+              esac
+              ;;
+          esac
+
+      - name: Install the site
+        run: |
+          cd "$CIVI_ROOT"
+          cv core:install --url=http://localhost --db="$DB_DSN"
+
+      - name: Point cv at the test database
+        # With CIVICRM_UF=UnitTests, civicrm.settings.php reads CIVICRM_DSN from
+        # $GLOBALS['_CV']['TEST_DB_DSN'], which cv supplies from its own config
+        # file keyed on the settings path. Outside buildkit nothing writes that
+        # for us.
+        #
+        # It points at the database just installed, rather than a separate empty
+        # one: CiviTestListener boots CiviCRM in full before Civi\Test can build
+        # any schema, so the test database has to already hold one. Civi\Test
+        # then drops and rebuilds it, and nothing else uses this install.
+        run: |
+          cd "$CIVI_ROOT"
+          echo "CV_CONFIG=$CIVI_ROOT/.cv.json" >> "$GITHUB_ENV"
+          php -r '
+            file_put_contents($argv[1], json_encode(
+              ["sites" => [$argv[2] => ["TEST_DB_DSN" => $argv[3]]]],
+              JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES
+            ));
+          ' "$CIVI_ROOT/.cv.json" "$(cv ev 'echo CIVICRM_SETTINGS_PATH;')" "$DB_DSN?new_link=true"
+
+      - name: Install the extension and its dependencies
+        env:
+          GIT_DEPENDENCIES: ${{ inputs.git-dependencies }}
+          EXTENSION_DEPENDENCIES: ${{ inputs.extension-dependencies }}
+        run: |
+          cd "$CIVI_ROOT"
+          # Fail here rather than inside the phpunit bootstrap, where the same
+          # problem surfaces as an opaque "TEST_DB_DSN is not set".
+          CIVICRM_UF=UnitTests cv ev --level=settings 'echo CIVICRM_DSN;' | grep -q "$DB_NAME" \
+            || { echo "cv cannot see the test database:"; cat "$CV_CONFIG"; exit 1; }
+
+          EXT_DIR=$(cv ev 'echo \Civi::paths()->getPath(\Civi::settings()->get("extensionsDir") . "/.");')
+          EXT_DIR=${EXT_DIR%/.}
+          # Bail out rather than symlink into / if the setting came back empty.
+          case "$EXT_DIR" in
+            /*/*) ;;
+            *) echo "Could not determine extensionsDir (got: '$EXT_DIR')"; exit 1 ;;
+          esac
+          mkdir -p "$EXT_DIR"
+          echo "EXT_DIR=$EXT_DIR" >> "$GITHUB_ENV"
+
+          # The extension's own key, so this workflow is not tied to one repository.
+          EXT_KEY=$(php -r 'echo simplexml_load_file(getenv("GITHUB_WORKSPACE") . "/info.xml")->attributes()["key"];')
+          [ -n "$EXT_KEY" ] || { echo "Could not read the extension key from info.xml"; exit 1; }
+          echo "extension key: $EXT_KEY"
+          echo "EXT_KEY=$EXT_KEY" >> "$GITHUB_ENV"
+          # Symlinked rather than copied so --log-junit below lands in the checkout.
+          ln -s "$GITHUB_WORKSPACE" "$EXT_DIR/$EXT_KEY"
+
+          for spec in $GIT_DEPENDENCIES; do
+            key=${spec%%|*}
+            rest=${spec#*|}
+            repo=${rest%%|*}
+            ref=${rest##*|}
+            echo "cloning $key from $repo at $ref"
+            git clone --quiet --depth 1 -b "$ref" "$repo" "$EXT_DIR/$key"
+          done
+
+          if [ -n "$EXTENSION_DEPENDENCIES" ]; then
+            # Include extensions that have not been through review.
+            cv ev '\Civi::settings()->set("ext_repo_url", "https://civicrm.org/extdir/ver={ver}|cms={uf}|ready=");'
+            cv ev '\Civi::settings()->set("http_timeout", 60);'
+            for e in $EXTENSION_DEPENDENCIES; do cv api3 Extension.download key="$e" install=0; done
+          fi
+
+      - name: Run PHPUnit
+        env:
+          CIVICRM_UF: UnitTests
+        run: |
+          cd "$EXT_DIR/$EXT_KEY"
+          "$CIVI_ROOT/vendor/bin/phpunit" --colors=never --log-junit "$GITHUB_WORKSPACE/junit.xml"
+
+      - name: Upload the test report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: junit-php${{ inputs.php-version }}-civicrm-${{ inputs.civicrm-version }}
+          path: junit.xml
+          if-no-files-found: warn
+          retention-days: 7

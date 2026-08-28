@@ -1,0 +1,33 @@
+# Which stacks this extension is tested against. The mechanics live in the
+# workflow this one calls, so they can be shared with other extension
+# repositories.
+
+name: PHPUnit
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+concurrency:
+  group: phpunit-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The oldest stack the extension claims to support. Must pass.
+  current:
+    uses: ./.github/workflows/phpunit-run.yml
+    with:
+      php-version: "8.3"
+      civicrm-version: "~6.17.0"
+
+  # Early warning of core drift. Runs alongside the above but never blocks a
+  # pull request.
+  next:
+    uses: ./.github/workflows/phpunit-run.yml
+    with:
+      php-version: "8.4"
+      civicrm-version: "dev-master"
+      experimental: true
